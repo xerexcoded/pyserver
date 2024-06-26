@@ -2,14 +2,27 @@
 import re
 import socket
 
+def parse_headers(request_data):
+    headers = {}
+    header_lines = request_data.split('\r\n')[1:]  # Skip the request line
+    for line in header_lines:
+        if line:
+            key, value = line.split(': ', 1)
+            headers[key.lower()] = value
+    return headers
+
+
 def handle_request(client_socket):
     request_data = client_socket.recv(1024).decode("utf-8")
+    print(request_data) # Print the request data to the console for debugging purposes
     request_lines = request_data.split("\r\n") # Split the request data into lines, they came in as \r\n separated strings which is CRLF (Carriage Return Line Feed) in ASCII
 
     #Parse the URL path from the request line
     request_line = request_lines[0]
     request_line_parts = request_line.split(" ")
     url_path = request_line_parts[1] # URL path is the second part of the request line, the first part is the method (GET, POST, etc.), and the third part is the HTTP version
+
+    headers = parse_headers(request_data) # Parse the headers from the request data, and store them in a dictionary
 
     #Check if path matches the /echo/{str} pattern
     echo_match = re.match(r'^/echo/(.+)$', url_path)
@@ -20,6 +33,10 @@ def handle_request(client_socket):
         echo_string = echo_match.group(1)
         content_length = len(echo_string)
         response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\n\r\n{echo_string}"
+    elif url_path == "/user-agent":
+        user_agent = headers.get("user-agent", "")
+        content_length = len(user_agent)
+        response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\n\r\n{user_agent}"
     else:
         response = "HTTP/1.1 404 Not Found\r\n\r\n"
     client_socket.sendall(response.encode("utf-8"))
