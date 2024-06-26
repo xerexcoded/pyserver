@@ -1,4 +1,5 @@
 # Uncomment this to pass the first stage
+import re
 import socket
 
 def handle_request(client_socket):
@@ -9,8 +10,16 @@ def handle_request(client_socket):
     request_line = request_lines[0]
     request_line_parts = request_line.split(" ")
     url_path = request_line_parts[1] # URL path is the second part of the request line, the first part is the method (GET, POST, etc.), and the third part is the HTTP version
+
+    #Check if path matches the /echo/{str} pattern
+    echo_match = re.match(r'^/echo/(.+)$', url_path)
+
     if url_path == "/":
         response = "HTTP/1.1 200 OK\r\n\r\n"
+    elif echo_match:
+        echo_string = echo_match.group(1)
+        content_length = len(echo_string)
+        response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\n\r\n{echo_string}"
     else:
         response = "HTTP/1.1 404 Not Found\r\n\r\n"
     client_socket.sendall(response.encode("utf-8"))
