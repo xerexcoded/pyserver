@@ -1,117 +1,103 @@
-# Uncomment this to pass the first stage
-import os
+import asyncio
+import argparse
 import re
-import socket
 import sys
-import threading
+from asyncio.streams import StreamReader, StreamWriter
+from pathlib import Path
 
+CONFIGURATION = {}
 
-def parse_headers(request_data):
+def log_error(*args, **kwargs):
+    print(*args, **kwargs, file=sys.stderr)
+
+def extract_request_data(content: bytes) -> tuple[str, str, dict[str, str], str]:
+    lines = content.split(b"\r\n")
+    request_line = lines[0]
+    method, path, _ = request_line.split(b" ")
+
     headers = {}
-    header_lines = request_data.split('\r\n')[1:]  # Skip the request line
-    for line in header_lines:
-        if line:
-            key, value = line.split(': ', 1)
-            headers[key.lower()] = value
-    return headers
+    body_start = 0
+    for i, line in enumerate(lines[1:], 1):
+        if line == b"":
+            body_start = i + 1
+            break
+        key, value = line.split(b": ")
+        headers[key.decode()] = value.decode()
 
+    body = b"".join(lines[body_start:]).decode()
+    return method.decode(), path.decode(), headers, body
 
-def handle_request(client_socket, directory):
-    try:
-        request_data = client_socket.recv(1024).decode("utf-8")
-        print(request_data)
-        request_lines = request_data.split("\r\n")
+def create_response(
+        status: int,
+        headers: dict[str, str] | None = None,
+        content: str = "",
+) -> bytes:
+    headers = headers or {}
+    status_messages = {
+        200: "OK",
+        201: "Created",
+        404: "Not Found",
+    }
 
-        request_line = request_lines[0]
-        method, url_path, _ = request_line.split(" ")
+    response_lines = [
+        f"HTTP/1.1 {status} {status_messages[status]}",
+        *[f"{k}: {v}" for k, v in headers.items()],
+        f"Content-Length: {len(content)}",
+        "",
+        content,
+    ]
 
-        headers = parse_headers(request_data)
+    return b"\r\n".join(line.encode() for line in response_lines)
 
-        if method == "GET":
-            handle_get_request(client_socket, url_path, headers, directory)
-        elif method == "POST":
-            handle_post_request(client_socket, url_path, headers, directory)
+async def process_request(reader: StreamReader, writer: StreamWriter) -> None:
+    method, path, headers, body = extract_request_data(await reader.read(2**16))
+
+    if re.fullmatch(r"/", path):
+        writer.write(b"HTTP/1.1 200 OK\r\n\r\n")
+        log_error(f"[OUT] /")
+    elif re.fullmatch(r"/user-agent", path):
+        ua = headers["User-Agent"]
+        writer.write(create_response(200, {"Content-Type": "text/plain"}, ua))
+        log_error(f"[OUT] user-agent {ua}")
+    elif match := re.fullmatch(r"/echo/(.+)", path):
+        msg = match.group(1)
+        writer.write(create_response(200, {"Content-Type": "text/plain"}, msg))
+        log_error(f"[OUT] echo {msg}")
+    elif match := re.fullmatch(r"/files/(.+)", path):
+        file_path = Path(CONFIGURATION["DIR"]) / match.group(1)
+
+        if method.upper() == "GET" and file_path.is_file():
+            writer.write(
+                create_response(
+                    200,
+                    {"Content-Type": "application/octet-stream"},
+                    file_path.read_text(),
+                )
+            )
+        elif method.upper() == "POST":
+            file_path.write_bytes(body.encode())
+            writer.write(create_response(201))
         else:
-            response = "HTTP/1.1 405 Method Not Allowed\r\n\r\n"
-            client_socket.sendall(response.encode("utf-8"))
-
-    except Exception as e:
-        print(f"An error occurred: {e}")
-    finally:
-        client_socket.close()
-
-def handle_post_request(client_socket, url_path, headers, directory):
-    file_match = re.match(r'^/files/(.+)$', url_path)
-
-    if file_match and directory:
-        filename = file_match.group(1)
-        content_length = int(headers.get('content-length', 0))
-
-        # Read the request body
-        body = client_socket.recv(content_length).decode("utf-8")
-
-        file_path = os.path.join(directory, filename)
-
-        # Write the content to the file
-        with open(file_path, "w") as file:
-            file.write(body)
-
-        response = "HTTP/1.1 201 Created\r\n\r\n"
+            writer.write(create_response(404))
+        log_error(f"[OUT] file {path}")
     else:
-        response = "HTTP/1.1 404 Not Found\r\n\r\n"
+        writer.write(create_response(404, {}, ""))
+        log_error(f"[OUT] 404")
 
-    client_socket.sendall(response.encode("utf-8"))
+    writer.close()
 
-def handle_get_request(client_socket, url_path, headers, directory):
-    echo_match = re.match(r'^/echo/(.+)$', url_path)
-    file_match = re.match(r'^/files/(.+)$', url_path)
+async def run_server():
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument("--directory", default=".")
+    args = arg_parser.parse_args()
+    CONFIGURATION["DIR"] = args.directory
 
-    if url_path == "/":
-        response = "HTTP/1.1 200 OK\r\n\r\n"
-    elif echo_match:
-        echo_string = echo_match.group(1)
-        content_length = len(echo_string)
-        response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\n\r\n{echo_string}"
-    elif file_match and directory:
-        file_name = file_match.group(1)
-        file_path = os.path.join(directory, file_name)
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as file:
-                file_content = file.read()
-            content_length = len(file_content)
-            response = f"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {content_length}\r\n\r\n".encode() + file_content
-        else:
-            response = "HTTP/1.1 404 Not Found\r\n\r\n"
-    elif url_path == "/user-agent":
-        user_agent = headers.get("user-agent", "")
-        content_length = len(user_agent)
-        response = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {content_length}\r\n\r\n{user_agent}"
-    else:
-        response = "HTTP/1.1 404 Not Found\r\n\r\n"
+    server = await asyncio.start_server(process_request, "localhost", 4221)
 
-    if isinstance(response, str):
-        response = response.encode("utf-8")
-    client_socket.sendall(response)
-
-def main():
-    print("Starting xerex server...")
-    directory = None
-    if len(sys.argv) == 3 and sys.argv[1] == "--directory": # example: python3 main.py --directory /path/to/directory
-        directory = sys.argv[2] # /path/to/directory
-
-    server_socket = socket.create_server(("localhost", 4221), reuse_port=True)
-    print("Server is running on port 4221!!!")
-
-    if directory:
-        print(f"Server is serving from directory: {directory}")
-    else:
-        print("No directory specified. File serving is disabled.")
-
-    while True:
-        client_socket, addr = server_socket.accept()
-        print(f"Connection from {addr}")
-        client_thread = threading.Thread(target=handle_request, args=(client_socket, directory))
-        client_thread.start()
+    async with server:
+        log_error("Starting server...")
+        log_error(f"--directory {CONFIGURATION['DIR']}")
+        await server.serve_forever()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run_server())
