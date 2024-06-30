@@ -6,6 +6,7 @@ from asyncio.streams import StreamReader, StreamWriter
 from pathlib import Path
 import gzip
 import base64
+import io
 
 CONFIGURATION = {}
 
@@ -32,7 +33,7 @@ def extract_request_data(content: bytes) -> tuple[str, str, dict[str, str], str]
 def create_response(
         status: int,
         headers: dict[str, str] | None = None,
-        content: str | bytes = "",
+        content: str | bytes = b"",
 ) -> bytes:
     headers = headers or {}
     status_messages = {
@@ -44,14 +45,16 @@ def create_response(
     if isinstance(content, str):
         content = content.encode()
 
+    headers['Content-Length'] = str(len(content))
+
     response_lines = [
         f"HTTP/1.1 {status} {status_messages[status]}",
         *[f"{k}: {v}" for k, v in headers.items()],
-        f"Content-Length: {len(content)}",
         "",
     ]
 
     return b"\r\n".join(line.encode() for line in response_lines) + b"\r\n" + content
+
 
 
 
@@ -66,31 +69,32 @@ async def process_request(reader: StreamReader, writer: StreamWriter) -> None:
         log_error(f"[OUT] /")
     elif re.fullmatch(r"/user-agent", path):
         ua = headers["User-Agent"]
-        response_headers = {"Content-Type": "text/plain"}
-        content = ua
-        if accepts_gzip:
-            response_headers["Content-Encoding"] = "gzip"
-            content = base64.b64encode(gzip.compress(ua.encode())).decode()
-        writer.write(create_response(200, response_headers, content))
+        writer.write(create_response(200, {"Content-Type": "text/plain"}, ua))
         log_error(f"[OUT] user-agent {ua}")
     elif match := re.fullmatch(r"/echo/(.+)", path):
         msg = match.group(1)
         response_headers = {"Content-Type": "text/plain"}
-        content = msg
+        content = msg.encode()
         if accepts_gzip:
             response_headers["Content-Encoding"] = "gzip"
-            content = base64.b64encode(gzip.compress(msg.encode())).decode()
+            compressed = io.BytesIO()
+            with gzip.GzipFile(fileobj=compressed, mode='w') as f:
+                f.write(content)
+            content = compressed.getvalue()
         writer.write(create_response(200, response_headers, content))
         log_error(f"[OUT] echo {msg}")
     elif match := re.fullmatch(r"/files/(.+)", path):
         file_path = Path(CONFIGURATION["DIR"]) / match.group(1)
 
         if method.upper() == "GET" and file_path.is_file():
-            content = file_path.read_text()
+            content = file_path.read_bytes()
             response_headers = {"Content-Type": "application/octet-stream"}
             if accepts_gzip:
                 response_headers["Content-Encoding"] = "gzip"
-                content = base64.b64encode(gzip.compress(content.encode())).decode()
+                compressed = io.BytesIO()
+                with gzip.GzipFile(fileobj=compressed, mode='w') as f:
+                    f.write(content)
+                content = compressed.getvalue()
             writer.write(create_response(200, response_headers, content))
         elif method.upper() == "POST":
             file_path.write_bytes(body.encode())
